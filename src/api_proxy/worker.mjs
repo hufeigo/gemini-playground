@@ -79,8 +79,33 @@ const makeHeaders = (apiKey, more) => ({
   ...more
 });
 
+// Outbound requests to Google carry a hard timeout. Without it, a host that
+// cannot reach generativelanguage.googleapis.com (network-restricted
+// environments) leaves the request pending forever — the browser eventually
+// reports "signal timed out" with no hint about the real cause. 10s is well
+// under the frontend's 15s timeout so the proxy surfaces the reason first.
+// handleCompletions deliberately has no timeout: streamed generations may
+// legitimately take minutes.
+const UPSTREAM_TIMEOUT_MS = 10_000;
+
+async function fetchUpstream (url, init) {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+  } catch (err) {
+    if (err?.name === "TimeoutError" || err?.name === "AbortError") {
+      throw new HttpError(
+        `Upstream request to ${new URL(url).host} timed out after ${UPSTREAM_TIMEOUT_MS / 1000}s — ` +
+        "this host cannot reach the Gemini API directly. " +
+        "If your network blocks Google, deploy the Cloudflare Worker proxy and point clients at that domain.",
+        504,
+      );
+    }
+    throw err;
+  }
+}
+
 async function handleModels (apiKey) {
-  const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
+  const response = await fetchUpstream(`${BASE_URL}/${API_VERSION}/models`, {
     headers: makeHeaders(apiKey),
   });
   let { body } = response;
@@ -88,11 +113,17 @@ async function handleModels (apiKey) {
     const { models } = JSON.parse(await response.text());
     body = JSON.stringify({
       object: "list",
-      data: models.map(({ name }) => ({
+      data: models.map(({ name, supportedGenerationMethods }) => ({
         id: name.replace("models/", ""),
         object: "model",
         created: 0,
         owned_by: "",
+        // Non-OpenAI extension: lets the web UI detect which models are
+        // usable with the Live API (bidiGenerateContent). OpenAI clients
+        // ignore unknown fields, so exposing this is safe.
+        ...(supportedGenerationMethods && {
+          supported_generation_methods: supportedGenerationMethods,
+        }),
       })),
     }, null, "  ");
   }
@@ -114,7 +145,7 @@ async function handleEmbeddings (req, apiKey) {
     req.model = DEFAULT_EMBEDDINGS_MODEL;
     model = "models/" + req.model;
   }
-  const response = await fetch(`${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`, {
+  const response = await fetchUpstream(`${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
     body: JSON.stringify({
@@ -141,7 +172,10 @@ async function handleEmbeddings (req, apiKey) {
   return new Response(body, fixCors(response));
 }
 
-const DEFAULT_MODEL = "gemini-1.5-pro-latest";
+// Fallback for requests whose model is not a gemini-*/learnlm-* name (e.g.
+// a client hardcoding "gpt-4o"). The previous value, gemini-1.5-pro-latest,
+// has been retired by Google — such requests silently fell through to a 404.
+const DEFAULT_MODEL = "gemini-3.6-flash";
 async function handleCompletions (req, apiKey) {
   let model = DEFAULT_MODEL;
   switch(true) {
@@ -349,23 +383,48 @@ const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse
   //"OTHER": "OTHER",
   // :"function_call",
 };
-const SEP = "\n\n|>";
-const transformCandidates = (key, cand) => ({
-  index: cand.index || 0, // 0-index is absent in new -002 models response
-  [key]: {
-    role: "assistant",
-    content: cand.content?.parts.map(p => p.text).join(SEP) },
-  logprobs: null,
-  finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
-});
+// Gemini 3.x "thinking" models may return several kinds of parts:
+//   {text, thought: true}          — chain-of-thought, must not pollute content
+//   {text}                         — the actual answer
+//   {functionCall}, {thoughtSignature}, ... — parts with no text at all
+// The old implementation joined every part's .text (stringifying missing
+// fields as "undefined") with a "\n\n|>" separator. Now thought text goes to
+// a separate DeepSeek-style reasoning_content field (widely understood by
+// OpenAI-compatible clients); answer parts concatenate seamlessly and
+// text-less parts are skipped.
+const extractParts = (cand) => {
+  let content = "";
+  let reasoning = "";
+  for (const part of cand.content?.parts || []) {
+    if (typeof part?.text !== "string") { continue; }
+    if (part.thought) { reasoning += part.text; } else { content += part.text; }
+  }
+  return { content, reasoning };
+};
+const transformCandidates = (key, cand) => {
+  const { content, reasoning } = extractParts(cand);
+  return {
+    index: cand.index || 0, // 0-index is absent in new -002 models response
+    [key]: {
+      role: "assistant",
+      content,
+      ...(reasoning && { reasoning_content: reasoning }),
+    },
+    logprobs: null,
+    finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
+  };
+};
 const transformCandidatesMessage = transformCandidates.bind(null, "message");
 const transformCandidatesDelta = transformCandidates.bind(null, "delta");
 
-const transformUsage = (data) => ({
-  completion_tokens: data.candidatesTokenCount,
-  prompt_tokens: data.promptTokenCount,
-  total_tokens: data.totalTokenCount
-});
+const transformUsage = (data) => {
+  const { candidatesTokenCount, promptTokenCount, totalTokenCount } = data || {};
+  return {
+    completion_tokens: candidatesTokenCount,
+    prompt_tokens: promptTokenCount,
+    total_tokens: totalTokenCount
+  };
+};
 
 const processCompletionsResponse = (data, model, id) => {
   return JSON.stringify({
@@ -401,7 +460,13 @@ async function parseStreamFlush (controller) {
 function transformResponseStream (data, stop, first) {
   const item = transformCandidatesDelta(data.candidates[0]);
   if (stop) { item.delta = {}; } else { item.finish_reason = null; }
-  if (first) { item.delta.content = ""; } else { delete item.delta.role; }
+  if (first) {
+    // The "first" chunk only announces the role; the same data is emitted
+    // again as a regular chunk right after, which carries the content — so
+    // neutralize both fields here or they would be duplicated.
+    item.delta.content = "";
+    delete item.delta.reasoning_content;
+  } else { delete item.delta.role; }
   const output = {
     id: this.id,
     choices: [item],
