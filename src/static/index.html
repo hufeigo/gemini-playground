@@ -1,94 +1,214 @@
 <!--
-//Author: ChrisKyle
-//Project: https://github.com/ViaAnthroposBenevolentia/gemini-2-live-api-demo
-//MIT License : https://github.com/ViaAnthroposBenevolentia/gemini-2-live-api-demo/blob/main/LICENSE
+Reverse-proxy test console for gemini-playground.
+The original Live API playground is preserved at live.html.
 -->
 
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gemini Multimodal Live API Client</title>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" />
-    <link rel="stylesheet" href="css/style.css">
+    <title>Gemini 反代理测试台</title>
+    <style>
+        :root {
+            --bg: #0f1115;
+            --card: #171a21;
+            --border: #2a2f3a;
+            --text: #e6e9ef;
+            --muted: #8b93a3;
+            --accent: #4f8cff;
+            --ok: #34c77b;
+            --fail: #ff5d5d;
+            --code-bg: #0b0d12;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            background: var(--bg);
+            color: var(--text);
+            font: 14px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        }
+        header {
+            padding: 22px 24px 14px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 8px;
+        }
+        header h1 { margin: 0; font-size: 20px; }
+        header .sub { color: var(--muted); font-size: 13px; }
+        header .sub a { color: var(--accent); text-decoration: none; }
+        main { max-width: 880px; margin: 0 auto; padding: 20px 16px 40px; }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 18px 20px;
+            margin-bottom: 18px;
+        }
+        .card h2 { margin: 0 0 14px; font-size: 15px; color: var(--text); }
+        .card h2 code {
+            color: var(--muted);
+            background: var(--code-bg);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        .row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        input[type="password"], input[type="text"], select, textarea {
+            background: var(--code-bg);
+            border: 1px solid var(--border);
+            color: var(--text);
+            border-radius: 6px;
+            padding: 8px 10px;
+            font-size: 13px;
+            font-family: inherit;
+        }
+        #api-key-input { flex: 1 1 260px; font-family: Consolas, monospace; }
+        #msg-input { width: 100%; resize: vertical; font-family: inherit; }
+        select { min-width: 220px; }
+        button {
+            background: var(--accent);
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            padding: 8px 16px;
+            font-size: 13px;
+            cursor: pointer;
+        }
+        button:hover { filter: brightness(1.1); }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        button.ghost {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text);
+        }
+        .hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+        .dot {
+            display: inline-block;
+            width: 10px; height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+            background: var(--muted);
+            vertical-align: middle;
+        }
+        .dot.ok { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+        .dot.fail { background: var(--fail); box-shadow: 0 0 6px var(--fail); }
+        .dot.pending { background: #f5b942; }
+        #conn-result { margin-top: 12px; font-size: 13px; }
+        .meta { color: var(--muted); font-size: 12px; margin: 10px 0 8px; }
+        pre {
+            background: var(--code-bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 12px;
+            font: 12px/1.5 Consolas, "Courier New", monospace;
+            white-space: pre-wrap;
+            word-break: break-all;
+            margin: 8px 0;
+            max-height: 340px;
+            overflow: auto;
+        }
+        pre.content { min-height: 52px; }
+        details { margin: 8px 0; font-size: 13px; }
+        details summary {
+            cursor: pointer;
+            color: var(--muted);
+            user-select: none;
+        }
+        details[open] summary { color: var(--accent); margin-bottom: 4px; }
+        .toggle { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 5px; }
+        .specs { margin: 0 0 12px; padding-left: 18px; color: var(--muted); font-size: 13px; }
+        .specs code {
+            color: var(--text);
+            background: var(--code-bg);
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+        #curl-pre { color: #9ecbff; }
+        footer {
+            text-align: center;
+            color: var(--muted);
+            font-size: 12px;
+            padding: 16px;
+            border-top: 1px solid var(--border);
+        }
+        footer code { color: var(--text); }
+        .hidden { display: none; }
+    </style>
 </head>
 <body>
-    <div id="app">
-        <div class="settings">
-            <input type="password" id="api-key" placeholder="Please Input Gemini API Key" />
-            <button id="config-toggle" class="material-symbols-outlined">settings</button>
-        </div>
-        <div id="config-container" class="hidden-mobile">
-            <div class="config-wrapper">
-                <div class="setting-container">
-                    <span class="setting-label">Language: </span>
-                    <select id="language-select">
-                    </select>
-                </div>
-                <div class="setting-container">
-                    <span class="setting-label">Sound: </span>
-                    <select id="voice-select">
-                        <option value="Puck">Puck (Male)</option>
-                        <option value="Charon">Charon (Male)</option>
-                        <option value="Fenrir">Fenrir (Male)</option>
-                        <option value="Kore">Kore (Female)</option>
-                        <option value="Aoede" selected>Aoede (Female)</option>
-                    </select>
-                </div>
-                <div class="setting-container">
-                    <span class="setting-label">Response Type: </span>
-                    <select id="response-type-select">
-                        <option value="text">Text</option>
-                        <option value="audio" selected>Audio</option>
-                    </select>
-                </div>
-                <div class="setting-container">
-                    <span class="setting-label">Video FPS: </span>
-                    <input type="number" id="fps-input" placeholder="Video FPS" value="1" min="1" max="30" step="1"/>
-                    <span class="fps-help">Higher FPS need more network bandwidth</span>
-                </div>
-                <textarea id="system-instruction" placeholder="Enter custom system instructions..." rows="6"></textarea>
-                <button id="apply-config">Confirm</button>
+    <header>
+        <h1>Gemini 反代理测试台</h1>
+        <div class="sub">OpenAI 兼容接口 · 输入 API Key 即测代理是否正常 · <a href="live.html">Live 语音 Playground →</a></div>
+    </header>
+
+    <main>
+        <section class="card">
+            <h2>1 · API Key <code>GET /v1/models</code></h2>
+            <div class="row">
+                <input type="password" id="api-key-input" placeholder="AIza... (Gemini API Key)" autocomplete="off">
+                <button class="ghost" id="key-visibility-toggle">显示</button>
+                <button id="test-connection-btn">测试连接</button>
             </div>
-        </div>
-        <button id="connect-button">Connect</button>
-        <div id="logs-container"></div>
-        <input type="text" id="message-input" placeholder="Enter message...">
-        <button id="send-button">Send</button>
-        <button id="mic-button">
-            <span id="mic-icon" class="material-symbols-outlined">mic</span>
-        </button>
-        <button id="camera-button">
-            <span id="camera-icon" class="material-symbols-outlined">videocam</span>
-        </button>
-        <button id="screen-button">
-            <span id="screen-icon" class="material-symbols-outlined">screen_share</span>
-        </button>
-        <div class="audio-visualizers">
-            <div class="visualizer-container">
-                <label>Input Audio</label>
-                <div id="input-audio-visualizer"></div>
+            <div id="conn-result" class="hidden">
+                <span class="dot" id="conn-dot"></span><span id="conn-text"></span>
             </div>
-            <div class="visualizer-container">
-                <label>Output Audio</label>
-                <div id="audio-visualizer"></div>
+            <details id="conn-detail-wrap" class="hidden">
+                <summary>详情</summary>
+                <pre id="conn-detail"></pre>
+            </details>
+            <p class="hint">Key 只保存在本浏览器 localStorage,随请求转发给 Google,不落盘。</p>
+        </section>
+
+        <section class="card">
+            <h2>2 · 对话测试 <code>POST /v1/chat/completions</code></h2>
+            <div class="row">
+                <select id="model-select" title="模型"></select>
+                <label class="toggle"><input type="checkbox" id="stream-toggle" checked> 流式输出(stream)</label>
             </div>
-        </div>
-        <div id="video-container" style="display: none;">
-            <video id="preview" playsinline autoplay muted></video>
-            <div class="video-controls">
-                <button id="stop-video">Stop Video</button>
-                <button id="flip-camera">
-                    <span class="material-symbols-outlined">flip_camera_ios</span>
-                </button>
+            <textarea id="msg-input" rows="3">Testing. Just say hi and nothing else.</textarea>
+            <div class="row">
+                <button id="send-btn" class="primary">发送请求</button>
             </div>
-        </div>
-        <div id="screen-container" style="display: none;">
-            <video id="screen-preview" playsinline autoplay muted></video>
-            <button class="close-button material-symbols-outlined">close</button>
-        </div>
-    </div>
-    <script src="js/main.js" type="module"></script>
+            <div id="chat-result" class="hidden">
+                <div class="meta" id="result-meta"></div>
+                <details id="reasoning-wrap" class="hidden">
+                    <summary>思考过程(reasoning_content)</summary>
+                    <pre id="result-reasoning"></pre>
+                </details>
+                <pre class="content" id="result-content"></pre>
+                <details id="result-raw-wrap">
+                    <summary>原始响应 / 错误详情</summary>
+                    <pre id="result-raw"></pre>
+                </details>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>3 · 接入你的客户端</h2>
+            <ul class="specs">
+                <li>Base URL:<code id="base-url-code">/v1</code></li>
+                <li>API Key:你的 Gemini Key(Authorization: Bearer)</li>
+                <li>模型:<code id="curl-model-code">gemini-3.6-flash</code>(任意 gemini-* 均可透传)</li>
+            </ul>
+            <pre id="curl-pre"></pre>
+            <button class="ghost" id="copy-curl-btn">复制 curl 命令</button>
+        </section>
+    </main>
+
+    <footer>
+        端点:<code>GET /v1/models</code> · <code>POST /v1/chat/completions</code> · <code>POST /v1/embeddings</code>
+    </footer>
+
+    <script src="js/proxy-test.js"></script>
 </body>
 </html>
