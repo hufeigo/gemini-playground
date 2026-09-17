@@ -38,6 +38,8 @@ const systemInstructionInput = document.getElementById('system-instruction');
 systemInstructionInput.value = CONFIG.SYSTEM_INSTRUCTION.TEXT;
 const applyConfigButton = document.getElementById('apply-config');
 const responseTypeSelect = document.getElementById('response-type-select');
+const modelSelect = document.getElementById('model-select');
+const modelRefreshButton = document.getElementById('model-refresh');
 
 // Load saved values from localStorage
 const savedApiKey = localStorage.getItem('gemini_api_key');
@@ -45,6 +47,7 @@ const savedVoice = localStorage.getItem('gemini_voice');
 const savedLanguage = localStorage.getItem('gemini_language');
 const savedFPS = localStorage.getItem('video_fps');
 const savedSystemInstruction = localStorage.getItem('system_instruction');
+const savedModel = localStorage.getItem('gemini_model');
 
 
 if (savedApiKey) {
@@ -83,6 +86,155 @@ applyConfigButton.addEventListener('click', () => {
     configContainer.classList.toggle('active');
     configToggle.classList.toggle('active');
 });
+
+// ===== Model selection =====
+
+/**
+ * Live API requires full model names with the "models/" prefix.
+ * The /v1/models proxy returns bare ids, so normalize here.
+ * @param {string} name
+ * @returns {string}
+ */
+function normalizeModelName(name) {
+    if (!name) {
+        return '';
+    }
+    return name.startsWith('models/') ? name : `models/${name}`;
+}
+
+/**
+ * A model is usable for the Live API (bidiGenerateContent over WebSocket)
+ * only if it is a "-live" model (e.g. gemini-3.8-live). Plain REST models
+ * like gemini-3.6-flash have no live variant — Google rejects them with
+ * "not supported for bidiGenerateContent". When the proxy passes
+ * supported_generation_methods we use it; otherwise fall back to the id.
+ * @param {{id: string, methods?: string[]}} entry
+ * @returns {boolean}
+ */
+function isLiveModel(entry) {
+    if (Array.isArray(entry.methods)) {
+        return entry.methods.includes('bidiGenerateContent');
+    }
+    return entry.id.includes('live');
+}
+
+/**
+ * Fills the model dropdown. Live-capable models are listed first (marked
+ * with ⚡) because this Web UI talks to the Gemini Live API; other models
+ * remain selectable but Connect substitutes a live model for the session.
+ * @param {{id: string, methods?: string[]}[]} entries - bare model ids
+ */
+function populateModelSelect(entries) {
+    const deduped = [...new Map(entries.map(e => [e.id, e]))].map(e => ({
+        id: e.id,
+        live: isLiveModel(e),
+    }));
+    const sorted = deduped.sort((a, b) =>
+        (a.live === b.live) ? a.id.localeCompare(b.id) : (a.live ? -1 : 1));
+    modelSelect.innerHTML = '';
+    sorted.forEach(({ id, live }) => {
+        const option = document.createElement('option');
+        option.value = id;
+        option.textContent = live ? `⚡ ${id}` : `${id} (no live)`;
+        option.title = live
+            ? 'Live API capable — supports voice/video sessions'
+            : 'REST-only model — Connect will substitute a live model';
+        option.dataset.live = live ? '1' : '0';
+        modelSelect.appendChild(option);
+    });
+    // Restore previously selected model (or config default)
+    const preferred = (savedModel || CONFIG.API.MODEL_NAME).replace('models/', '');
+    if (preferred) {
+        if (![...modelSelect.options].some(o => o.value === preferred)) {
+            const option = document.createElement('option');
+            option.value = preferred;
+            option.textContent = preferred;
+            option.dataset.live = isLiveModel({ id: preferred }) ? '1' : '0';
+            modelSelect.appendChild(option);
+        }
+        modelSelect.value = preferred;
+    }
+}
+
+/**
+ * Returns the model id to open the Live API session with. If selectedId is
+ * live-capable it is used as-is; otherwise the best live model from the
+ * dropdown (or the config default) is substituted and the user is told why.
+ * @param {string} selectedId
+ * @returns {string}
+ */
+function resolveLiveModel(selectedId) {
+    const options = [...modelSelect.options];
+    const selectedOpt = options.find(o => o.value === selectedId);
+    const selectedLive = selectedOpt
+        ? selectedOpt.dataset.live === '1'
+        : isLiveModel({ id: selectedId });
+    if (selectedLive) {
+        return selectedId;
+    }
+    const preferredLive = CONFIG.API.MODEL_NAME.replace('models/', '');
+    const substitute = options.some(o => o.value === preferredLive)
+        ? preferredLive
+        : (options.find(o => o.dataset.live === '1')?.value ?? preferredLive);
+    logMessage(
+        `"${selectedId}" has no Live API support — Google only accepts -live models ` +
+        `(bidiGenerateContent) for voice/video sessions. Using "${substitute}" instead.`,
+        'system'
+    );
+    return substitute;
+}
+
+/**
+ * Loads the model list from the OpenAI-compatible /v1/models proxy.
+ * Falls back to CONFIG.API.MODEL_LIST_FALLBACK when the request fails
+ * (e.g. no API key entered yet, or the deployment has no proxy).
+ */
+async function loadModelList(manual = false) {
+    const fallback = (CONFIG.API.MODEL_LIST_FALLBACK || [])
+        .map(m => ({ id: m.replace('models/', '') }));
+    if (!apiKeyInput.value) {
+        populateModelSelect(fallback);
+        return;
+    }
+    // Remember a failed auto-load for this tab session so page reloads don't
+    // wait on an unreachable proxy again. The refresh button always retries.
+    if (!manual && sessionStorage.getItem('model_list_failed')) {
+        populateModelSelect(fallback);
+        return;
+    }
+    try {
+        const resp = await fetch('/v1/models', {
+            headers: { 'Authorization': `Bearer ${apiKeyInput.value}` },
+            signal: AbortSignal.timeout(15000)
+        });
+        if (!resp.ok) {
+            let detail = '';
+            try { detail = (await resp.text()).slice(0, 160); } catch (_) { /* unreadable body */ }
+            throw new Error(`HTTP ${resp.status}${detail ? ` — ${detail}` : ''}`);
+        }
+        const data = await resp.json();
+        const entries = (data.data || [])
+            .map(m => ({ id: m.id, methods: m.supported_generation_methods }))
+            .filter(e => e.id);
+        if (!entries.length) {
+            throw new Error('empty model list');
+        }
+        populateModelSelect(entries);
+        sessionStorage.removeItem('model_list_failed');
+        logMessage(`Loaded ${ids.length} models from API`);
+    } catch (err) {
+        sessionStorage.setItem('model_list_failed', '1');
+        populateModelSelect(fallback);
+        logMessage(`Failed to load model list (${err.message}), using fallback list`);
+    }
+}
+
+modelRefreshButton.addEventListener('click', () => loadModelList(true));
+apiKeyInput.addEventListener('change', () => {
+    sessionStorage.removeItem('model_list_failed');
+    loadModelList(true);
+});
+loadModelList();
 
 // State variables
 let isRecording = false;
@@ -267,9 +419,14 @@ async function connectToWebsocket() {
     localStorage.setItem('gemini_voice', voiceSelect.value);
     localStorage.setItem('gemini_language', languageSelect.value);
     localStorage.setItem('system_instruction', systemInstructionInput.value);
+    if (modelSelect.value) {
+        localStorage.setItem('gemini_model', modelSelect.value);
+    }
 
+    // Live API sessions only accept "-live" models; a REST-only pick is
+    // substituted (with a log message) instead of failing the setup.
     const config = {
-        model: CONFIG.API.MODEL_NAME,
+        model: normalizeModelName(resolveLiveModel(modelSelect.value || CONFIG.API.MODEL_NAME)),
         generationConfig: {
             responseModalities: responseTypeSelect.value,
             speechConfig: {
