@@ -6,8 +6,9 @@ const $ = (id) => document.getElementById(id);
 
 const KEY_STORAGE = 'gemini_api_key';   // shared with the Live playground page
 const MODEL_STORAGE = 'proxy_test_model';
-const DEFAULT_MODEL = 'gemini-3.6-flash';
+const DEFAULT_MODEL = 'gemini-flash-lite-latest';
 const FALLBACK_MODELS = [
+    'gemini-flash-lite-latest',
     'gemini-3.6-flash',
     'gemini-3.8-flash',
     'gemini-3.7-flash',
