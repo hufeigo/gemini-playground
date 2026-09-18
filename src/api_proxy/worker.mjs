@@ -14,8 +14,14 @@ export default {
       return new Response(err.message, fixCors({ status: err.status ?? 500 }));
     };
     try {
-      const auth = request.headers.get("Authorization");
-      const apiKey = auth?.split(" ")[1];
+      // Accept "Authorization: Bearer <key>" (OpenAI standard), a raw
+      // "Authorization: <key>" (some clients omit the Bearer prefix) and
+      // "x-api-key: <key>" (another common convention). Trailing
+      // whitespace is trimmed — copy-paste artifacts otherwise silently
+      // become "API key not valid" upstream.
+      const auth = request.headers.get("Authorization")
+        ?? request.headers.get("x-api-key");
+      const apiKey = auth?.replace(/^\s*Bearer\s+/i, "").trim() || undefined;
       const assert = (success) => {
         if (!success) {
           throw new HttpError("The specified HTTP method is not allowed for the requested resource", 400);
@@ -52,10 +58,20 @@ class HttpError extends Error {
   }
 }
 
+// Forwarded responses get REBUILT headers. Copying the upstream header
+// set (content-length, content-encoding, ...) onto a re-read or
+// re-encoded body crashes Deno Deploy at the platform level
+// (INTERNAL_SERVER_ERROR / connection resets) — observed on every
+// non-2xx upstream response, while 2xx responses only survived because
+// their upstream headers happened to be harmless. Keep it deterministic:
+// preserve upstream status + content-type, add CORS, drop everything else.
 const fixCors = ({ headers, status, statusText }) => {
-  headers = new Headers(headers);
-  headers.set("Access-Control-Allow-Origin", "*");
-  return { headers, status, statusText };
+  const upstreamType = headers?.get?.("content-type");
+  const rebuilt = new Headers({
+    "content-type": upstreamType || "application/json; charset=utf-8",
+    "access-control-allow-origin": "*",
+  });
+  return { headers: rebuilt, status, statusText };
 };
 
 const handleOPTIONS = async () => {
@@ -88,9 +104,15 @@ const makeHeaders = (apiKey, more) => ({
 // legitimately take minutes.
 const UPSTREAM_TIMEOUT_MS = 10_000;
 
+// Manual AbortController instead of AbortSignal.timeout(): the latter
+// crashes the Deno Deploy isolate with a platform-level INTERNAL_SERVER_-
+// ERROR (and is missing in some older runtimes). The timer is always
+// cleared so it never delays the end of the request lifecycle.
 async function fetchUpstream (url, init) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   try {
-    return await fetch(url, { ...init, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+    return await fetch(url, { ...init, signal: controller.signal });
   } catch (err) {
     if (err?.name === "TimeoutError" || err?.name === "AbortError") {
       throw new HttpError(
@@ -101,6 +123,8 @@ async function fetchUpstream (url, init) {
       );
     }
     throw err;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -126,6 +150,11 @@ async function handleModels (apiKey) {
         }),
       })),
     }, null, "  ");
+  } else {
+    // Read eagerly: forwarding the upstream ReadableStream directly into
+    // the response is unstable on some runtimes (Deno Deploy isolate
+    // errors); plain text is safe everywhere.
+    body = await response.text();
   }
   return new Response(body, fixCors(response));
 }
@@ -168,6 +197,10 @@ async function handleEmbeddings (req, apiKey) {
       })),
       model: req.model,
     }, null, "  ");
+  } else {
+    // Same Deploy-compat rule as handleModels: never forward the upstream
+    // ReadableStream straight into the response — read it eagerly.
+    body = await response.text();
   }
   return new Response(body, fixCors(response));
 }
@@ -219,6 +252,10 @@ async function handleCompletions (req, apiKey) {
       body = await response.text();
       body = processCompletionsResponse(JSON.parse(body), model, id);
     }
+  } else {
+    // Error responses are read eagerly (Deploy-compat: never forward the
+    // upstream ReadableStream straight into the response).
+    body = await response.text();
   }
   return new Response(body, fixCors(response));
 }
@@ -304,11 +341,50 @@ const parseImg = async (url) => {
   };
 };
 
-const transformMsg = async ({ role, content }) => {
+// Maps tool_call_id → function name across a history so that "tool" role
+// messages (which only carry tool_call_id) can be translated into Gemini
+// functionResponse parts (which carry the function name).
+const transformMsg = async ({ role, content, tool_calls }, toolNameById) => {
   const parts = [];
+  // assistant tool_calls → model functionCall parts.
+  // content is legitimately null on such turns (OpenAI: "Required unless
+  // tool_calls is specified") — the part itself stays well-formed.
+  if (Array.isArray(tool_calls)) {
+    for (const tc of tool_calls) {
+      const fn = tc?.function;
+      if (!fn || typeof fn.name !== "string") { continue; }
+      let args = {};
+      if (typeof fn.arguments === "string" && fn.arguments) {
+        try {
+          args = JSON.parse(fn.arguments);
+        } catch (err) {
+          console.error("Invalid tool_call arguments JSON:", err);
+        }
+      } else if (fn.arguments && typeof fn.arguments === "object") {
+        args = fn.arguments;
+      }
+      parts.push({
+        functionCall: { name: fn.name, args },
+        // Round-trip the Gemini thoughtSignature (see extractParts) — without
+        // it Google rejects replayed function calls on 3.x thinking models.
+        ...((tc.thought_signature ?? fn.thought_signature) && {
+          thoughtSignature: tc.thought_signature ?? fn.thought_signature,
+        }),
+      });
+      if (tc.id) { toolNameById.set(tc.id, fn.name); }
+    }
+  }
   if (!Array.isArray(content)) {
     // system, user: string
     // assistant: string or null (Required unless tool_calls is specified.)
+    // OpenAI allows null content — e.g. tool_calls-only turns or
+    // reasoning-only turns replayed from history. Google rejects a part
+    // with no initialized field ("required oneof field 'data' must have
+    // one initialized field"), so text-less turns fall back to whatever
+    // parts were built above, or the message is dropped entirely.
+    if (content === null || content === undefined) {
+      return parts.length ? { role, parts } : null;
+    }
     parts.push({ text: content });
     return { role, parts };
   }
@@ -319,7 +395,9 @@ const transformMsg = async ({ role, content }) => {
   for (const item of content) {
     switch (item.type) {
       case "text":
-        parts.push({ text: item.text });
+        if (typeof item.text === "string") {
+          parts.push({ text: item.text });
+        }
         break;
       case "image_url":
         parts.push(await parseImg(item.image_url.url));
@@ -345,34 +423,110 @@ const transformMsg = async ({ role, content }) => {
 const transformMessages = async (messages) => {
   if (!messages) { return; }
   const contents = [];
+  const toolNameById = new Map();
   let system_instruction;
+  // Consecutive "tool" messages (one assistant turn with parallel tool_calls)
+  // must be merged into ONE Gemini content — function responses belonging to
+  // the same call batch may not be split across turns.
+  const pushToolResponse = (entry) => {
+    const prev = contents[contents.length - 1];
+    if (prev && prev.role === "user" && prev.parts.length
+        && prev.parts.every(p => p.functionResponse)) {
+      prev.parts.push(...entry.parts);
+    } else {
+      contents.push(entry);
+    }
+  };
   for (const item of messages) {
     if (item.role === "system") {
-      delete item.role;
-      system_instruction = await transformMsg(item);
+      const { role, ...rest } = item; // role is not part of system_instruction
+      const sys = await transformMsg(rest, toolNameById);
+      if (sys) { system_instruction = sys; }
+    } else if (item.role === "tool") {
+      // OpenAI tool result (tool_call_id + content) → Gemini functionResponse
+      // (role "user" per the Gemini function-calling convention).
+      const name = item.tool_call_id && toolNameById.get(item.tool_call_id);
+      if (name) {
+        let result = item.content;
+        if (typeof item.content === "string" && item.content) {
+          try {
+            result = JSON.parse(item.content);
+          } catch { /* keep as plain string */ }
+        }
+        pushToolResponse({
+          role: "user",
+          parts: [{ functionResponse: { name, response: { result } } }],
+        });
+      } else if (item.content != null && item.content !== "") {
+        // Cannot correlate with a tool_call (missing/foreign id) — degrade
+        // to plain text so the tool output still reaches the model.
+        contents.push({ role: "user", parts: [{ text: String(item.content) }] });
+      }
     } else {
-      item.role = item.role === "assistant" ? "model" : "user";
-      contents.push(await transformMsg(item));
+      const msg = await transformMsg({
+        ...item,
+        role: item.role === "assistant" ? "model" : "user",
+      }, toolNameById);
+      if (msg) { contents.push(msg); }
     }
   }
-  if (system_instruction && contents.length === 0) {
-    contents.push({ role: "model", parts: { text: " " } });
+  if (contents.length === 0) {
+    // Google rejects empty contents (all messages were dropped or none
+    // were sent) — keep a minimal placeholder turn.
+    contents.push({ role: system_instruction ? "model" : "user", parts: { text: " " } });
   }
-  //console.info(JSON.stringify(contents, 2));
   return { system_instruction, contents };
+};
+
+// OpenAI tools → Gemini function declarations.
+//   [{type:"function", function:{name, description, parameters}}]
+//     → [{functionDeclarations:[{name, description, parameters}]}]
+// parameters is JSON Schema on both sides and passes through unchanged.
+// tool_choice ("auto"|"none"|"required"|{function:{name}}) maps onto
+// toolConfig.functionCallingConfig (AUTO|NONE|ANY + allowedFunctionNames).
+const transformTools = (req) => {
+  if (!Array.isArray(req.tools)) { return {}; }
+  const functionDeclarations = [];
+  for (const t of req.tools) {
+    const fn = t?.type === "function" ? t.function
+      : (t && typeof t.name === "string") ? t  // tolerate raw declarations
+      : null;
+    if (!fn || typeof fn.name !== "string") { continue; }
+    functionDeclarations.push({
+      name: fn.name,
+      ...(fn.description && { description: fn.description }),
+      ...(fn.parameters && { parameters: fn.parameters }),
+    });
+  }
+  if (!functionDeclarations.length) { return {}; }
+  const out = { tools: [{ functionDeclarations }] };
+  const tc = req.tool_choice;
+  if (tc === "auto" || tc === undefined || tc === null) {
+    // explicit AUTO (also the Gemini default) for determinism
+    out.toolConfig = { functionCallingConfig: { mode: "AUTO" } };
+  } else if (tc === "none") {
+    out.toolConfig = { functionCallingConfig: { mode: "NONE" } };
+  } else if (tc === "required") {
+    out.toolConfig = { functionCallingConfig: { mode: "ANY" } };
+  } else if (tc && typeof tc === "object" && tc.function?.name) {
+    out.toolConfig = { functionCallingConfig: { mode: "ANY", allowedFunctionNames: [tc.function.name] } };
+  }
+  return out;
 };
 
 const transformRequest = async (req) => ({
   ...await transformMessages(req.messages),
+  ...transformTools(req),
   safetySettings,
   generationConfig: transformConfig(req),
 });
 
-const generateChatcmplId = () => {
+const randomId = (length) => {
   const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   const randomChar = () => characters[Math.floor(Math.random() * characters.length)];
-  return "chatcmpl-" + Array.from({ length: 29 }, randomChar).join("");
+  return Array.from({ length }, randomChar).join("");
 };
+const generateChatcmplId = () => "chatcmpl-" + randomId(29);
 
 const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse#finishreason
   //"FINISH_REASON_UNSPECIFIED": // Default value. This value is unused.
@@ -380,38 +534,64 @@ const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse
   "MAX_TOKENS": "length",
   "SAFETY": "content_filter",
   "RECITATION": "content_filter",
+  // The model attempted a function call that did not validate — surfaced
+  // (mainly) when tools were dropped from the request by older proxies.
+  // OpenAI clients see a clean finish instead of an empty turn.
+  "MALFORMED_FUNCTION_CALL": "stop",
   //"OTHER": "OTHER",
   // :"function_call",
 };
 // Gemini 3.x "thinking" models may return several kinds of parts:
 //   {text, thought: true}          — chain-of-thought, must not pollute content
 //   {text}                         — the actual answer
-//   {functionCall}, {thoughtSignature}, ... — parts with no text at all
+//   {functionCall}                 — tool invocation → OpenAI tool_calls
+//   {thoughtSignature}, ...        — parts with no text at all
 // The old implementation joined every part's .text (stringifying missing
 // fields as "undefined") with a "\n\n|>" separator. Now thought text goes to
 // a separate DeepSeek-style reasoning_content field (widely understood by
-// OpenAI-compatible clients); answer parts concatenate seamlessly and
-// text-less parts are skipped.
+// OpenAI-compatible clients); function calls become tool_calls; answer parts
+// concatenate seamlessly and remaining text-less parts are skipped.
 const extractParts = (cand) => {
   let content = "";
   let reasoning = "";
+  const toolCalls = [];
   for (const part of cand.content?.parts || []) {
+    if (part?.functionCall) {
+      toolCalls.push({
+        id: "call_" + randomId(24),
+        type: "function",
+        function: {
+          name: part.functionCall.name,
+          arguments: JSON.stringify(part.functionCall.args ?? {}),
+        },
+        // Gemini 3.x attaches a thoughtSignature to functionCall parts which
+        // MUST be replayed back on the next turn, or Google rejects the
+        // request with 400 "Function call is missing a thought_signature".
+        // The OpenAI schema has no such field — carrying it as an extension
+        // on the tool_call lets spec-tolerant clients (which echo unknown
+        // fields back in history) round-trip it transparently.
+        ...(part.thoughtSignature && { thought_signature: part.thoughtSignature }),
+      });
+      continue;
+    }
     if (typeof part?.text !== "string") { continue; }
     if (part.thought) { reasoning += part.text; } else { content += part.text; }
   }
-  return { content, reasoning };
+  return { content, reasoning, toolCalls };
 };
 const transformCandidates = (key, cand) => {
-  const { content, reasoning } = extractParts(cand);
+  const { content, reasoning, toolCalls } = extractParts(cand);
   return {
     index: cand.index || 0, // 0-index is absent in new -002 models response
     [key]: {
       role: "assistant",
-      content,
+      // OpenAI contract: content is null when the turn is tool_calls-only.
+      content: toolCalls.length ? (content || null) : content,
       ...(reasoning && { reasoning_content: reasoning }),
+      ...(toolCalls.length && { tool_calls: toolCalls }),
     },
     logprobs: null,
-    finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
+    finish_reason: toolCalls.length ? "tool_calls" : reasonsMap[cand.finishReason] || cand.finishReason,
   };
 };
 const transformCandidatesMessage = transformCandidates.bind(null, "message");
@@ -427,6 +607,14 @@ const transformUsage = (data) => {
 };
 
 const processCompletionsResponse = (data, model, id) => {
+  if (!Array.isArray(data.candidates) || data.candidates.length === 0) {
+    // Blocked/empty upstream answer (e.g. safety promptFeedback) — surface
+    // the actual reason instead of crashing on .map(undefined).
+    throw new HttpError(
+      `Gemini returned no candidates: ${JSON.stringify(data.promptFeedback ?? data)}`,
+      502,
+    );
+  }
   return JSON.stringify({
     id,
     choices: data.candidates.map(transformCandidatesMessage),
@@ -466,6 +654,7 @@ function transformResponseStream (data, stop, first) {
     // neutralize both fields here or they would be duplicated.
     item.delta.content = "";
     delete item.delta.reasoning_content;
+    delete item.delta.tool_calls;
   } else { delete item.delta.role; }
   const output = {
     id: this.id,
