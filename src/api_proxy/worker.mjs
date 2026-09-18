@@ -478,6 +478,105 @@ const transformMessages = async (messages) => {
   return { system_instruction, contents };
 };
 
+// ── JSON Schema sanitisation ────────────────────────────────────────────────
+// Google's `parameters` accepts only a subset of JSON Schema (OpenAPI-3.0
+// style, proto-validated). Full JSON Schema from real clients (LangChain,
+// MCP, agent frameworks) gets rejected with 400 "Unknown name
+// \"additionalProperties\" at 'tools[0].function_declarations[...]':
+// Cannot find field". Everything below rewrites such schemas into the
+// accepted subset:
+//   • whitelisted keys only (additionalProperties/$schema/allOf/… dropped)
+//   • local $ref/$defs inlined (dropping $ref alone would leave LangChain
+//     schemas empty)
+//   • allOf members merged into one object
+//   • oneOf → anyOf (proto has anyOf; exact-one is not enforced anyway)
+//   • type unions (["string","null"]) flattened + nullable=true
+//   • enum values coerced to strings (proto takes repeated string)
+const SCHEMA_KEYS = new Set([
+  "type", "format", "title", "description", "nullable", "default",
+  "maxItems", "minItems", "enum", "maxLength", "minLength", "pattern",
+  "minimum", "maximum", "properties", "required", "items", "anyOf",
+]);
+const pointerGet = (root, pointer) => {
+  let node = root;
+  for (const raw of pointer.split("/")) {
+    const seg = raw.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (node == null || !(seg in Object(node))) { return undefined; }
+    node = node[seg];
+  }
+  return node;
+};
+const normalizeSchema = (node, root, depth = 0) => {
+  if (Array.isArray(node)) { return node.map(n => normalizeSchema(n, root, depth)); }
+  if (!node || typeof node !== "object") { return node; }
+  if (depth > 12) { return {}; } // $ref cycles / pathological nesting
+  if (typeof node.$ref === "string" && node.$ref.startsWith("#/")) {
+    const target = pointerGet(root, node.$ref.slice(2));
+    if (target && typeof target === "object") {
+      const { $ref, ...siblings } = node;
+      return normalizeSchema({ ...target, ...siblings }, root, depth + 1);
+    }
+    console.error("Unresolvable $ref:", node.$ref);
+    return {};
+  }
+  if (Array.isArray(node.allOf)) {
+    const { allOf, ...self } = node;
+    const merged = { ...self };
+    for (const sub of allOf) {
+      const norm = normalizeSchema(sub, root, depth + 1);
+      if (!norm || typeof norm !== "object") { continue; }
+      for (const [k, v] of Object.entries(norm)) {
+        if (k === "properties" && merged.properties && typeof v === "object") {
+          merged.properties = { ...merged.properties, ...v };
+        } else if (k === "required" && merged.required) {
+          merged.required = [...new Set([...merged.required, ...v])];
+        } else if (!(k in merged)) {
+          merged[k] = v;
+        }
+      }
+    }
+    return normalizeSchema(merged, root, depth + 1);
+  }
+  const out = {};
+  for (const [key, value] of Object.entries(node)) {
+    switch (key) {
+      case "properties":
+        out.properties = Object.fromEntries(
+          Object.entries(value || {}).map(([pk, pv]) => [pk, normalizeSchema(pv, root, depth + 1)]),
+        );
+        break;
+      case "items":
+        out.items = normalizeSchema(value, root, depth + 1);
+        break;
+      case "anyOf":
+      case "oneOf":
+        out.anyOf = (Array.isArray(value) ? value : [value])
+          .map(s => normalizeSchema(s, root, depth + 1));
+        break;
+      case "enum":
+        out.enum = value.map(e => (typeof e === "string" ? e : JSON.stringify(e)));
+        break;
+      case "type":
+        if (Array.isArray(value)) {
+          const primary = value.find(t => t !== "null");
+          out.type = primary || "string";
+          if (value.includes("null")) { out.nullable = true; }
+        } else if (value === "null") {
+          out.type = "string";
+          out.nullable = true;
+        } else {
+          out.type = value;
+        }
+        break;
+      default:
+        if (SCHEMA_KEYS.has(key)) { out[key] = value; }
+        // else: additionalProperties / $schema / exclusiveMinimum / ... —
+        // not representable in Google's schema subset, dropped deliberately.
+    }
+  }
+  return out;
+};
+
 // OpenAI tools → Gemini function declarations.
 //   [{type:"function", function:{name, description, parameters}}]
 //     → [{functionDeclarations:[{name, description, parameters}]}]
@@ -495,7 +594,7 @@ const transformTools = (req) => {
     functionDeclarations.push({
       name: fn.name,
       ...(fn.description && { description: fn.description }),
-      ...(fn.parameters && { parameters: fn.parameters }),
+      ...(fn.parameters && { parameters: normalizeSchema(fn.parameters, fn.parameters) }),
     });
   }
   if (!functionDeclarations.length) { return {}; }
